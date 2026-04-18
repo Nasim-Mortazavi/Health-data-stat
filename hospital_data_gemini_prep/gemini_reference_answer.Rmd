@@ -1,0 +1,787 @@
+---
+title: "Predictors of In-Hospital Mortality — GEMINI Cohort"
+author: "Reference Answer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: kate
+    df_print: kable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  comment    = "",
+  fig.align  = "center",
+  fig.width  = 8,
+  fig.height = 5
+)
+
+pacman::p_load(
+  tidyverse, lubridate, table1, broom,
+  janitor, knitr, kableExtra, stringr,
+  pROC, car, scales, pheatmap, RColorBrewer
+)
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+---
+
+# 1 — Cohort Construction
+
+**Question:** *Who is in the study, and how did we arrive at the analytic sample?*
+
+**Why:** Every observational study must define a reproducible cohort with
+explicit, sequential inclusion/exclusion criteria. The attrition table lets
+reviewers assess generalizability, detect selection bias, and understand
+exactly which records were dropped and why.
+
+```{r load-data}
+# ---- Admin/encounter-level file ----
+ipadmdad_raw <- read.csv("ipadmdad.csv") %>%
+  mutate(
+    admission_date_time = ymd_hm(admission_date_time),
+    discharge_date_time = ymd_hm(discharge_date_time)
+  )
+```
+
+```{r cohort-build}
+n0 <- nrow(ipadmdad_raw)
+
+# Step 1 — Adults only (age >= 18, non-missing)
+cohort <- ipadmdad_raw %>%
+  filter(!is.na(age), age >= 18)
+n1 <- nrow(cohort)
+
+# Step 2 — Non-missing discharge disposition (needed to derive outcome)
+cohort <- cohort %>%
+  filter(!is.na(discharge_disposition),
+         trimws(as.character(discharge_disposition)) != "")
+n2 <- nrow(cohort)
+
+# Step 3 — LOS >= 4 hours (removes miscodings, rapid transfers)
+cohort <- cohort %>%
+  mutate(los_hrs = as.numeric(
+    difftime(discharge_date_time, admission_date_time, units = "hours")
+  )) %>%
+  filter(!is.na(los_hrs), los_hrs >= 4)
+n3 <- nrow(cohort)
+
+# Step 4 — Study window: 3 Ontario fiscal years (Apr 2019 – Mar 2022)
+cohort <- cohort %>%
+  filter(admission_date_time >= ymd("2019-04-01"),
+         admission_date_time <  ymd("2022-04-01"))
+n4 <- nrow(cohort)
+
+tibble(
+  Step    = c("Raw admissions",
+              "Adults (age ≥ 18)",
+              "Non-missing discharge disposition",
+              "LOS ≥ 4 hours",
+              "Within study period (Apr 2019 – Mar 2022)"),
+  N       = c(n0, n1, n2, n3, n4),
+  Excluded = c(NA_integer_, n0 - n1, n1 - n2, n2 - n3, n3 - n4)
+) %>%
+  kable(caption = "Table S1 — Cohort attrition",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+```
+
+The analytic cohort includes **`r format(n4, big.mark = ",")`** encounters
+across **`r n_distinct(cohort$hospital_num)`** hospitals.
+
+---
+
+# 2 — Data Quality & Sanity Checks
+
+**Question:** *Is the data plausible and complete enough to support the planned
+analysis?*
+
+**Why:** EHR data is messy. Before any modelling, you must verify that key
+variables have realistic distributions, that missingness isn't systematic (e.g.,
+concentrated in specific hospitals), and that obvious data errors are flagged.
+This is 30% of the GEMINI data scientist role and the step most candidates skip.
+
+## 2.1 Plausible-range checks on continuous variables
+
+```{r sanity-ranges}
+tibble(
+  Variable = c("Age", "LOS (hours)"),
+  Min      = c(min(cohort$age), min(cohort$los_hrs)),
+  Q1       = c(quantile(cohort$age, 0.25), quantile(cohort$los_hrs, 0.25)),
+  Median   = c(median(cohort$age), median(cohort$los_hrs)),
+  Q3       = c(quantile(cohort$age, 0.75), quantile(cohort$los_hrs, 0.75)),
+  Max      = c(max(cohort$age), max(cohort$los_hrs)),
+  `N flagged` = c(
+    sum(cohort$age > 110),                # implausible age
+    sum(cohort$los_hrs > 365 * 24)        # > 1 year
+  )
+) %>%
+  mutate(across(Min:Max, ~ round(.x, 1))) %>%
+  kable(caption = "Sanity check — continuous variable ranges") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+```
+
+## 2.2 Age distribution by hospital
+
+```{r age-distribution, fig.height=4}
+ggplot(cohort, aes(x = age)) +
+  geom_histogram(binwidth = 5, fill = "#457B9D", colour = "white", linewidth = 0.2) +
+  facet_wrap(~ hospital_num, scales = "free_y", ncol = 4) +
+  labs(x = "Age (years)", y = "Count",
+       title = "Age distribution by hospital",
+       subtitle = "Check for implausible spikes, truncation, or rounding artefacts") +
+  theme(strip.text = element_text(size = 8))
+```
+
+## 2.3 Missingness heatmap by hospital
+
+```{r missingness-heatmap, fig.height=5, fig.width=9}
+# Compute % missing per hospital for all columns of interest
+cols_check <- c("gender", "hospital_num")
+# Add any other columns from your data that were NOT used as exclusion criteria
+# age, discharge_disposition, admission/discharge times are guaranteed non-missing
+# because you already filtered on them in Section 1
+
+miss_by_hosp <- cohort %>%
+  group_by(hospital_num) %>%
+  summarise(across(all_of(cols_check), ~ round(100 * mean(is.na(.x)), 2)),
+            .groups = "drop") %>%
+  column_to_rownames("hospital_num")
+mat <- as.matrix(miss_by_hosp)
+if (diff(range(mat, na.rm = TRUE)) < 0.001) {
+  cat("Missingness is uniformly", round(mat[1,1], 1),
+      "% across all hospitals — no heatmap needed.")
+} else {
+  pheatmap(
+    mat,
+    cluster_rows   = TRUE,
+    cluster_cols    = FALSE,
+    display_numbers = TRUE,
+    number_format   = "%.1f",
+    color           = colorRampPalette(c("white", "#E63946"))(50),
+    main            = "% Missing by Hospital — Core Admin Variables",
+    fontsize        = 10,
+    angle_col       = 45
+  )
+}
+```
+
+*Interpretation: If missingness clusters in specific hospitals, it may indicate
+systematic data-extraction issues rather than random missingness — this affects
+how we handle incomplete records downstream.*
+
+## 2.4 Crude mortality rate by hospital (face-validity check)
+
+```{r mortality-by-hospital, fig.height=4}
+hosp_mort <- cohort %>%
+  group_by(hospital_num) %>%
+  summarise(n = n(), deaths = sum(died <- as.integer(
+    discharge_disposition %in% c(7, 72, 73))),
+    rate = deaths / n, .groups = "drop") %>%
+  mutate(hospital_num = reorder(factor(hospital_num), rate))
+
+ggplot(hosp_mort, aes(x = hospital_num, y = rate)) +
+  geom_col(fill = "#264653") +
+  geom_hline(yintercept = mean(hosp_mort$rate), linetype = "dashed",
+             colour = "#E76F51", linewidth = 0.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(x = "Hospital", y = "Crude mortality rate",
+       title = "Crude in-hospital mortality by site",
+       subtitle = "Dashed line = overall mean. Large outliers may reflect case-mix or data issues.") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+---
+
+# 3 — Feature Engineering
+
+**Question:** *What analytic variables do we need to derive from raw fields, and
+how are they defined?*
+
+**Why:** Raw EHR data is never analysis-ready. Outcomes must be coded from
+administrative codes, comorbidities extracted via ICD-10-CA regex, and temporal
+features (LOS categories, admission timing) created explicitly. Every derivation
+must be documented to ensure reproducibility.
+
+## 3.1 Outcome — in-hospital mortality
+
+```{r derive-outcome}
+# CIHI discharge disposition codes: 7, 72, 73 = death
+cohort <- cohort %>%
+  mutate(died = as.integer(discharge_disposition %in% c(7, 72, 73)))
+
+cat("Deaths:", sum(cohort$died),
+    sprintf("(%.1f%%)\n", 100 * mean(cohort$died)))
+cat("Survivors:", sum(cohort$died == 0),
+    sprintf("(%.1f%%)", 100 * mean(cohort$died == 0)))
+```
+
+## 3.2 Length of stay
+
+```{r derive-los}
+cohort <- cohort %>%
+  mutate(
+    los_days     = los_hrs / 24,
+    los_days_cat = cut(los_days,
+                       breaks = c(0, 3, 7, 14, Inf),
+                       labels = c("≤3d", "4–7d", "8–14d", ">14d"),
+                       right  = TRUE)
+  )
+```
+
+## 3.3 Comorbidity flags (ICD-10-CA)
+
+We derive three common comorbidity indicators from admission diagnoses
+(types M, 1, 2, 3). This is a **simplified burden count**, not a validated
+Charlson or Elixhauser index.
+
+```{r derive-comorbidities}
+ipdiagnosis_raw <- read.csv("ipdiagnosis.csv")
+
+admit_dx <- ipdiagnosis_raw %>%
+  filter(genc_id %in% cohort$genc_id,
+         diagnosis_type %in% c("M", "1", "2", "3"),
+         !is.na(diagnosis_code), trimws(diagnosis_code) != "")
+
+comorb <- admit_dx %>%
+  mutate(
+    diabetes = as.integer(str_starts(diagnosis_code, "E1[01]")),
+    renal    = as.integer(str_starts(diagnosis_code, "N1[78]")),
+    cancer   = as.integer(str_starts(diagnosis_code, "C"))
+  ) %>%
+  group_by(genc_id) %>%
+  summarise(diabetes = max(diabetes),
+            renal    = max(renal),
+            cancer   = max(cancer),
+            n_dx     = n_distinct(diagnosis_code),
+            .groups  = "drop")
+
+cohort <- cohort %>%
+  left_join(comorb, by = "genc_id") %>%
+  mutate(across(c(diabetes, renal, cancer), ~ replace_na(.x, 0L)),
+         n_dx      = replace_na(n_dx, 0L),
+         dx_burden = diabetes + renal + cancer)
+```
+
+## 3.4 Admission timing
+
+```{r derive-timing}
+cohort <- cohort %>%
+  mutate(
+    weekend_admit = as.integer(wday(admission_date_time) %in% c(1, 7)),
+    fiscal_year   = if_else(month(admission_date_time) >= 4,
+                            year(admission_date_time),
+                            year(admission_date_time) - 1L),
+    admit_month   = floor_date(admission_date_time, "month")
+  )
+```
+
+## 3.5 Early lab values (first 24 hours)
+
+```{r derive-labs}
+lab_raw <- read.csv("lab.csv")
+
+lab_early <- lab_raw %>%
+  filter(genc_id %in% cohort$genc_id) %>%
+  inner_join(cohort %>% select(genc_id, admission_date_time), by = "genc_id") %>%
+  mutate(
+    collection_date_time = ymd_hm(collection_date_time),
+    hrs_since_admit = as.numeric(
+      difftime(collection_date_time, admission_date_time, units = "hours"))
+  ) %>%
+  filter(hrs_since_admit >= 0, hrs_since_admit <= 24)
+
+# First value per test per encounter
+lab_first <- lab_early %>%
+  group_by(genc_id, test_type_mapped_omop) %>%
+  slice_min(collection_date_time, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(genc_id, test_type_mapped_omop, result_value)
+
+# Pivot to wide: one column per lab test
+lab_wide <- lab_first %>%
+  pivot_wider(names_from  = test_type_mapped_omop,
+              values_from = result_value)
+
+cohort <- cohort %>%
+  left_join(lab_wide, by = "genc_id")
+
+# Identify lab columns dynamically
+lab_cols <- setdiff(names(lab_wide), "genc_id")
+cat("Lab tests available:", paste(lab_cols, collapse = ", "))
+```
+
+### Lab missingness assessment
+
+```{r lab-missingness, fig.height=5, fig.width=9}
+lab_miss_hosp <- cohort %>%
+  group_by(hospital_num) %>%
+  summarise(across(all_of(lab_cols), ~ round(100 * mean(is.na(.x)), 1)),
+            .groups = "drop") %>%
+  column_to_rownames("hospital_num")
+
+pheatmap(
+  as.matrix(lab_miss_hosp),
+  cluster_rows    = TRUE,
+  cluster_cols    = TRUE,
+  display_numbers = TRUE,
+  number_format   = "%.0f",
+  color           = colorRampPalette(c("#F1FAEE", "#A8DADC", "#E63946"))(50),
+  main            = "% Missing Lab Values (First 24h) by Hospital",
+  fontsize        = 9,
+  angle_col       = 45
+)
+```
+
+*Systematic missingness in specific hospitals suggests data-extraction gaps rather
+than clinical absence — these labs were likely collected but not captured.*
+
+### Lab plausible-range check
+
+```{r lab-ranges}
+# Quick sanity on any numeric lab columns
+cohort %>%
+  summarise(across(all_of(lab_cols),
+    list(
+      n_avail = ~ sum(!is.na(.x)),
+      median  = ~ round(median(.x, na.rm = TRUE), 1),
+      p5      = ~ round(quantile(.x, 0.05, na.rm = TRUE), 1),
+      p95     = ~ round(quantile(.x, 0.95, na.rm = TRUE), 1)
+    ), .names = "{.col}||{.fn}")) %>%
+  pivot_longer(everything(),
+               names_to = c("Lab", ".value"),
+               names_sep = "\\|\\|") %>%
+  kable(caption = "Lab value distributions (first 24h)") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+```
+
+---
+
+# 4 — Descriptive & Exploratory Analysis
+
+**Question:** *How do patient characteristics differ between those who died and
+those who survived? Are there temporal patterns or non-linear relationships we
+should account for in modelling?*
+
+**Why:** Table 1 is mandatory in every clinical manuscript — it establishes
+face-validity and identifies potential confounders. Exploratory plots go further:
+they reveal non-linearity, temporal trends (e.g., COVID waves), and unexpected
+patterns that inform model specification.
+
+## 4.1 Table 1 — Characteristics by outcome
+
+```{r table1}
+cohort_tbl <- cohort %>%
+  mutate(
+    Outcome  = factor(died, 0:1, c("Survived", "Died")),
+    Sex      = factor(gender, c("M", "F"), c("Male", "Female")),
+    Diabetes = factor(diabetes, 0:1, c("No", "Yes")),
+    CKD      = factor(renal, 0:1, c("No", "Yes")),
+    Cancer   = factor(cancer, 0:1, c("No", "Yes")),
+    `Diagnosis burden` = factor(n_dx),
+    `LOS category` = los_days_cat,
+    `Weekend admission` = factor(weekend_admit, 0:1, c("No", "Yes"))
+  )
+
+# table1 produces stratified descriptive stats with p-values via built-in tests
+table1(~ age + Sex + los_days + `LOS category` + Diabetes + CKD + Cancer +
+         `Weekend admission` + n_dx | Outcome,
+       data    = cohort_tbl,
+       caption = "Table 1 — Patient characteristics by in-hospital mortality")
+```
+
+## 4.2 Monthly mortality trend
+
+```{r monthly-trend, fig.height=4}
+monthly <- cohort %>%
+  group_by(admit_month) %>%
+  summarise(n = n(), deaths = sum(died),
+            rate = deaths / n, .groups = "drop")
+
+ggplot(monthly, aes(x = admit_month, y = rate)) +
+  geom_line(colour = "#264653", linewidth = 0.7) +
+  geom_point(colour = "#264653", size = 1.5) +
+  geom_smooth(method = "loess", se = TRUE, colour = "#E76F51",
+              fill = "#E76F51", alpha = 0.15, linewidth = 0.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_x_date(date_labels = "%b\n%Y", date_breaks = "3 months") +
+  labs(x = NULL, y = "Monthly mortality rate",
+       title = "In-hospital mortality over time",
+       subtitle = "Loess smoother highlights pandemic-period trends") +
+  theme(axis.text.x = element_text(size = 8))
+```
+
+*Look for mortality spikes during COVID-19 wave 1 (spring 2020) and wave 2
+(winter 2020–21). This motivates adjusting for fiscal year in the model.*
+
+## 4.3 Age–mortality relationship (non-linearity check)
+
+```{r age-mortality-curve, fig.height=4}
+# Binned approach: compute mortality rate per 5-year age bin
+age_bins <- cohort %>%
+  mutate(age_bin = cut(age, breaks = seq(18, 110, by = 5), right = FALSE)) %>%
+  group_by(age_bin) %>%
+  summarise(n = n(), rate = mean(died), .groups = "drop") %>%
+  filter(!is.na(age_bin)) %>%
+  mutate(mid = seq(20, by = 5, length.out = n()))
+
+ggplot(age_bins, aes(x = mid, y = rate)) +
+  geom_point(aes(size = n), colour = "#264653", alpha = 0.7) +
+  geom_smooth(method = "loess", se = TRUE, colour = "#E76F51",
+              fill = "#E76F51", alpha = 0.15) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_size_continuous(name = "N encounters", labels = comma) +
+  labs(x = "Age (5-year midpoint)", y = "Mortality rate",
+       title = "Mortality by age group",
+       subtitle = "Non-linear uptick above ~75 suggests spline or polynomial may be warranted")
+```
+
+## 4.4 LOS distribution by outcome
+
+```{r los-violin, fig.height=4}
+ggplot(cohort, aes(x = factor(died, 0:1, c("Survived", "Died")),
+                   y = los_days)) +
+  geom_violin(aes(fill = factor(died)), alpha = 0.5, show.legend = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA) +
+  scale_fill_manual(values = c("#457B9D", "#E63946")) +
+  scale_y_log10(labels = comma) +
+  labs(x = NULL, y = "Length of stay (days, log scale)",
+       title = "Length of stay distribution by outcome") +
+  annotation_logticks(sides = "l")
+```
+
+## 4.5 Lab correlation heatmap
+
+```{r lab-corr-heatmap, fig.height=6, fig.width=7}
+# Pairwise Spearman correlations among available lab values
+lab_mat <- cohort %>%
+  select(all_of(lab_cols)) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman")
+
+pheatmap(
+  lab_mat,
+  display_numbers = TRUE,
+  number_format   = "%.2f",
+  color           = colorRampPalette(
+    rev(brewer.pal(9, "RdBu")))(100),
+  breaks          = seq(-1, 1, length.out = 101),
+  main            = "Spearman correlation — First-24h lab values",
+  fontsize        = 9
+)
+```
+
+*Strong correlations between labs (e.g., creatinine and urea) signal potential
+multicollinearity if both are included in the regression.*
+
+## 4.6 Comorbidity co-occurrence
+
+```{r comorb-co-occurrence, fig.height=3.5, fig.width=5}
+comorb_mat <- cohort %>%
+  select(diabetes, renal, cancer) %>%
+  cor(method = "phi") # binary-binary: phi = Pearson on 0/1 vars
+
+pheatmap(
+  comorb_mat,
+  display_numbers = TRUE,
+  number_format   = "%.2f",
+  color           = colorRampPalette(c("#F1FAEE", "#1D3557"))(50),
+  main            = "Comorbidity co-occurrence (φ correlation)"
+)
+```
+
+---
+
+# 5 — Statistical Modelling
+
+**Question:** *Which patient-level factors are independently associated with
+in-hospital mortality after adjusting for confounders — and does adding early
+lab data improve prediction?*
+
+**Why:** Multivariable logistic regression isolates each predictor's contribution
+while holding others constant, producing adjusted ORs — the standard output in
+clinical epi. Comparing a base model (demographics + comorbidities) against a
+lab-augmented model quantifies the added predictive value of acute physiology.
+
+## 5.1 Base model — demographics + comorbidities
+
+Hospital is included as a fixed effect to absorb site-level differences in
+case-mix and practice. With `r n_distinct(cohort$hospital_num)` hospitals, a
+random-intercept model could be considered, but fixed effects are adequate for
+our focus on patient-level predictors.
+
+```{r base-model}
+mod_base <- glm(
+  died ~ age + gender + diabetes + renal + cancer +
+    weekend_admit + factor(fiscal_year) + factor(hospital_num),
+  data   = cohort,
+  family = binomial
+)
+```
+
+### Odds ratio table
+
+```{r or-table}
+tidy(mod_base, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(!str_starts(term, "factor\\(hospital_num\\)")) %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ round(.x, 2)),
+         p.value = format.pval(p.value, digits = 2, eps = 0.001)) %>%
+  select(Term = term, OR = estimate,
+         `2.5%` = conf.low, `97.5%` = conf.high,
+         p = p.value) %>%
+  kable(caption = "Table 2 — Adjusted ORs, base model (hospital effects suppressed)") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+```
+
+### Multicollinearity check (VIF)
+
+```{r vif-check}
+# Fit reduced model without factor(hospital_num) for clean VIF
+mod_vif <- glm(
+  died ~ age + gender + diabetes + renal + cancer +
+    weekend_admit + factor(fiscal_year),
+  data = cohort, family = binomial
+)
+
+vif_vals <- vif(mod_vif)
+# For factors, GVIF^(1/(2*Df)) is the comparable metric
+if (is.matrix(vif_vals)) {
+  vif_tbl <- as.data.frame(vif_vals) %>%
+    rownames_to_column("Term") %>%
+    mutate(GVIF_adj = round(`GVIF^(1/(2*Df))`, 2)) %>%
+    select(Term, GVIF_adj)
+} else {
+  vif_tbl <- tibble(Term = names(vif_vals), VIF = round(vif_vals, 2))
+}
+
+kable(vif_tbl, caption = "VIF — values > 5 suggest concerning collinearity") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Discrimination — ROC & AUC
+
+```{r base-auc, fig.height=5, fig.width=5}
+cohort$pred_base <- predict(mod_base, type = "response")
+roc_base <- roc(cohort$died, cohort$pred_base, quiet = TRUE)
+auc_base <- ci.auc(roc_base)
+
+# ROC curve
+ggroc(roc_base, colour = "#264653", linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", colour = "grey50") +
+  labs(title = "ROC — Base model",
+       subtitle = sprintf("AUC = %.3f (95%% CI %.3f–%.3f)",
+                          auc_base[2], auc_base[1], auc_base[3]),
+       x = "Specificity", y = "Sensitivity") +
+  coord_equal()
+```
+
+### Calibration plot
+
+```{r calibration-plot, fig.height=5, fig.width=5}
+# Decile-based calibration
+cohort <- cohort %>%
+  mutate(pred_decile = ntile(pred_base, 10))
+
+cal_df <- cohort %>%
+  group_by(pred_decile) %>%
+  summarise(
+    mean_predicted = mean(pred_base),
+    mean_observed  = mean(died),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(cal_df, aes(x = mean_predicted, y = mean_observed)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n), colour = "#E76F51", alpha = 0.8) +
+  geom_line(colour = "#E76F51", linewidth = 0.5) +
+  scale_size_continuous(name = "N per decile", labels = comma) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "Mean predicted probability", y = "Observed proportion",
+       title = "Calibration plot — Base model",
+       subtitle = "Perfect calibration lies on the diagonal") +
+  coord_equal(xlim = c(0, NA), ylim = c(0, NA))
+```
+
+### Forest plot
+
+```{r forest-plot, fig.width=8, fig.height=5}
+or_df <- tidy(mod_base, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)",
+         !str_starts(term, "factor\\(hospital_num\\)")) %>%
+  mutate(
+    label = case_match(
+      term,
+      "age"                      ~ "Age (per year)",
+      "genderM"                  ~ "Male sex",
+      "diabetes"                 ~ "Diabetes",
+      "renal"                    ~ "CKD",
+      "cancer"                   ~ "Cancer",
+      "weekend_admit"            ~ "Weekend admission",
+      "factor(fiscal_year)2020"  ~ "FY 2020 vs 2019",
+      "factor(fiscal_year)2021"  ~ "FY 2021 vs 2019"
+    ),
+    significant = p.value < 0.05
+  )
+
+ggplot(or_df, aes(x = estimate, y = reorder(label, estimate))) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high, colour = significant),
+    size = 0.6
+  ) +
+  scale_colour_manual(
+    values = c("TRUE" = "#D62828", "FALSE" = "#264653"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
+    name   = NULL
+  ) +
+  labs(x = "Adjusted Odds Ratio (95% CI)", y = NULL,
+       title = "Forest plot — Base model",
+       caption = "Hospital fixed effects estimated but suppressed. Reference: FY 2019.") +
+  theme(legend.position   = "bottom",
+        panel.grid.minor  = element_blank(),
+        panel.grid.major.y = element_blank())
+```
+
+## 5.2 Lab-augmented model & comparison
+
+We add selected first-24h lab values to the base model. Encounters with missing
+labs are excluded from this comparison (complete-case analysis on the overlapping
+subset for fair comparison).
+
+```{r lab-model}
+# Pick 2–3 clinically meaningful labs that exist in the data
+# (adjust column names based on what's available)
+lab_predictors <- intersect(lab_cols, names(cohort))
+
+# Use at most 3 labs to keep it parsimonious — pick by clinical relevance
+# Example: hemoglobin, creatinine, sodium (adjust to actual column names)
+if (length(lab_predictors) > 3) {
+  lab_predictors <- lab_predictors[1:3]  # take first 3; replace with clinical picks
+}
+
+# Build formula dynamically
+lab_formula <- as.formula(paste(
+  "died ~ age + gender + diabetes + renal + cancer +",
+  "weekend_admit + factor(fiscal_year) + factor(hospital_num) +",
+  paste(lab_predictors, collapse = " + ")
+))
+
+# Complete-case subset for fair comparison
+cc_idx <- complete.cases(cohort[, lab_predictors])
+cat("Complete cases for lab model:", sum(cc_idx),
+    sprintf("(%.1f%% of cohort)\n", 100 * mean(cc_idx)))
+
+# Refit base on same subset
+mod_base_cc <- glm(
+  died ~ age + gender + diabetes + renal + cancer +
+    weekend_admit + factor(fiscal_year) + factor(hospital_num),
+  data = cohort[cc_idx, ], family = binomial
+)
+
+mod_lab <- glm(
+  lab_formula,
+  data = cohort[cc_idx, ], family = binomial
+)
+```
+
+### Likelihood ratio test (nested model comparison)
+
+```{r lrt}
+lrt <- anova(mod_base_cc, mod_lab, test = "Chisq")
+
+tibble(
+  Model     = c("Base", "Base + Labs"),
+  Deviance  = round(c(deviance(mod_base_cc), deviance(mod_lab)), 1),
+  df        = c(mod_base_cc$df.residual, mod_lab$df.residual),
+  `LRT p`   = c(NA, format.pval(lrt$`Pr(>Chi)`[2], digits = 3, eps = 0.001))
+) %>%
+  kable(caption = "Likelihood ratio test — Base vs Lab-augmented model") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### AUC comparison (DeLong test)
+
+```{r auc-comparison, fig.height=5, fig.width=6}
+pred_base_cc <- predict(mod_base_cc, type = "response")
+pred_lab     <- predict(mod_lab, type = "response")
+
+roc_base_cc <- roc(cohort$died[cc_idx], pred_base_cc, quiet = TRUE)
+roc_lab     <- roc(cohort$died[cc_idx], pred_lab, quiet = TRUE)
+
+# DeLong test for difference in AUCs
+delong <- roc.test(roc_base_cc, roc_lab, method = "delong")
+
+# Side-by-side ROC
+ggroc(list(Base = roc_base_cc, `Base + Labs` = roc_lab), linewidth = 0.7) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Base" = "#264653", "Base + Labs" = "#E76F51")) +
+  labs(
+    title = "ROC comparison — Base vs Lab-augmented",
+    subtitle = sprintf(
+      "AUC Base: %.3f | AUC +Labs: %.3f | DeLong p = %s",
+      auc(roc_base_cc), auc(roc_lab),
+      format.pval(delong$p.value, digits = 3, eps = 0.001)),
+    x = "Specificity", y = "Sensitivity", colour = "Model"
+  ) +
+  coord_equal() +
+  theme(legend.position = "bottom")
+```
+
+### Lab ORs
+
+```{r lab-or-table}
+tidy(mod_lab, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term %in% lab_predictors) %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ round(.x, 2)),
+         p.value = format.pval(p.value, digits = 2, eps = 0.001)) %>%
+  select(Lab = term, OR = estimate,
+         `2.5%` = conf.low, `97.5%` = conf.high,
+         p = p.value) %>%
+  kable(caption = "Adjusted ORs for lab predictors (augmented model)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+# 6 — Summary & Limitations
+
+This analysis examined **`r format(nrow(cohort), big.mark = ",")`** adult medical
+admissions across **`r n_distinct(cohort$hospital_num)`** GEMINI hospitals (April
+2019 – March 2022). **`r format(sum(cohort$died), big.mark = ",")`** in-hospital
+deaths occurred (`r round(100 * mean(cohort$died), 1)`%).
+
+**Key findings:**
+
+- Older age, renal disease, and cancer were independently associated with higher
+  in-hospital mortality after adjusting for demographics, comorbidities, admission
+  timing, and hospital.
+- The base model achieved an AUC of **`r round(auc_base[2], 3)`**.
+- Addition of early lab values [improved / did not improve] discrimination
+  (DeLong p = `r format.pval(delong$p.value, digits = 3)`).
+
+**Limitations:**
+
+1. **Residual confounding** — administrative data cannot capture functional status,
+   goals-of-care designation, or illness acuity at presentation.
+2. **Simplified comorbidity flags** — our three-condition approach does not replace
+   a validated index (Charlson, Elixhauser). A formal comorbidity score should be
+   used in a full analysis.
+3. **Complete-case lab analysis** — missingness was not random across hospitals.
+   Multiple imputation (e.g., `mice`) would better handle this in a full study.
+4. **Fixed-effect hospital adjustment** — with many hospitals, a mixed-effects model
+   (random intercept for hospital) would be more efficient and generalizable.
+5. **No external validation** — model performance may not generalise beyond the
+   GEMINI network.
+
+**Next steps:** Restricted cubic splines for age, multiple imputation for lab
+missingness, LASSO variable selection across a broader lab panel, and temporal
+validation (train on FY 2019–2020, test on FY 2021).

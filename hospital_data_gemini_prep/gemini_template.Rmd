@@ -1,0 +1,452 @@
+---
+title: "Template — Clinical EHR Cohort Analysis"
+author: "Nasim"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: kate
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  comment = "",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4
+)
+
+pacman::p_load(
+  tidyverse, lubridate, table1, broom,
+  janitor, knitr, kableExtra, stringr, pROC
+)
+```
+
+<!--
+==========================================================================
+SECTION 1 — COHORT CONSTRUCTION
+==========================================================================
+QUESTION:  Who is in the study and how did we arrive at the analytic sample?
+WHY:       Every observational study must define a reproducible cohort with
+           explicit inclusion/exclusion criteria. The attrition table lets
+           reviewers assess generalizability and whether exclusions introduced
+           selection bias. This is the first thing GEMINI collaborators check.
+========================================================================== -->
+
+# 1 — Cohort Construction
+
+```{r load-data}
+# input_admin  <- "ipadmdad.csv"
+# input_dt_admit <- "admission_date_time"
+# input_dt_disch <- "discharge_date_time"
+
+input_raw <- read.csv("INPUT_ADMIN_FILE.csv") %>%
+  mutate(
+    INPUT_DT_ADMIT = ymd_hm(INPUT_DT_ADMIT),
+    INPUT_DT_DISCH = ymd_hm(INPUT_DT_DISCH)
+  )
+```
+
+We apply sequential inclusion criteria and track attrition at each step.
+
+```{r cohort-exclusions}
+n0 <- nrow(input_raw)
+
+# Step 1: Restrict to adults
+# input_age <- "age"
+cohort <- input_raw %>%
+  filter(!is.na(INPUT_AGE), INPUT_AGE >= 18)
+n1 <- nrow(cohort)
+
+# Step 2: Non-missing outcome proxy
+# input_outcome_raw <- "discharge_disposition"
+cohort <- cohort %>%
+  filter(!is.na(INPUT_OUTCOME_RAW),
+         trimws(as.character(INPUT_OUTCOME_RAW)) != "")
+n2 <- nrow(cohort)
+
+# Step 3: Minimum length-of-stay (removes same-day transfers / errors)
+cohort <- cohort %>%
+  mutate(
+    los_hrs = as.numeric(
+      difftime(INPUT_DT_DISCH, INPUT_DT_ADMIT, units = "hours"))
+  ) %>%
+  filter(!is.na(los_hrs), los_hrs >= 4)
+n3 <- nrow(cohort)
+
+# Step 4: Study period window
+# input_start <- "2019-04-01"
+# input_end   <- "2022-04-01"
+cohort <- cohort %>%
+  filter(INPUT_DT_ADMIT >= ymd("INPUT_START_DATE"),
+         INPUT_DT_ADMIT <  ymd("INPUT_END_DATE"))
+n4 <- nrow(cohort)
+
+# Attrition table
+tibble(
+  Step    = c("Initial admissions",
+              "Age >= 18",
+              "Non-missing discharge disposition",
+              "LOS >= 4 hours",
+              "Study period (INPUT_START — INPUT_END)"),
+  N       = c(n0, n1, n2, n3, n4),
+  Dropped = c(NA_integer_, n0 - n1, n1 - n2, n2 - n3, n3 - n4)
+) %>%
+  kable(caption = "Table S1. Cohort attrition") %>%
+  kable_styling(full_width = FALSE)
+```
+
+The final analytic cohort includes **`r n4`** encounters.
+
+---
+
+<!--
+==========================================================================
+SECTION 2 — FEATURE ENGINEERING
+==========================================================================
+QUESTION:  What variables do we need to derive from the raw data, and how?
+WHY:       Raw EHR data is never analysis-ready. Outcomes must be coded from
+           disposition codes, continuous variables may need categorisation for
+           clinical interpretability, and comorbidities must be derived from
+           diagnosis tables using standard code sets (ICD-10-CA). Documenting
+           every derivation ensures reproducibility and transparency about
+           analytic decisions.
+========================================================================== -->
+
+# 2 — Feature Engineering
+
+## 2.1 Outcome: binary endpoint
+
+```{r derive-outcome}
+# CIHI discharge disposition codes indicating death: 7, 72, 73
+# input_death_codes <- c(7, 72, 73)
+
+cohort <- cohort %>%
+  mutate(died = as.integer(INPUT_OUTCOME_RAW %in% c(INPUT_DEATH_CODES)))
+
+cat("Events:", sum(cohort$died),
+    sprintf("(%.1f%%)", 100 * mean(cohort$died)))
+```
+
+## 2.2 Length of stay
+
+```{r derive-los}
+cohort <- cohort %>%
+  mutate(
+    los_days     = los_hrs / 24,
+    los_days_cat = cut(los_days,
+                       breaks = c(0, 3, 7, 14, Inf),
+                       labels = c("<3d", "3-7d", "7-14d", ">14d"),
+                       right  = TRUE)
+  )
+```
+
+## 2.3 Comorbidity flags from diagnosis codes
+
+We derive binary comorbidity indicators from admission diagnoses
+(types M, 1, 2, 3) using ICD-10-CA prefixes. This is **not** a validated
+Charlson index — it is a simplified disease-burden proxy for this analysis.
+
+```{r derive-comorbidities}
+# input_dx_file <- "ipdiagnosis.csv"
+# input_id      <- "genc_id"
+# input_dx_code <- "diagnosis_code"
+# input_dx_type <- "diagnosis_type"
+
+input_dx_raw <- read.csv("INPUT_DX_FILE.csv")
+
+admit_dx <- input_dx_raw %>%
+  filter(INPUT_ID %in% cohort$INPUT_ID,
+         INPUT_DX_TYPE %in% c("M", "1", "2", "3"),
+         !is.na(INPUT_DX_CODE), trimws(INPUT_DX_CODE) != "")
+
+# Flag each condition per encounter using ICD-10-CA regex
+# input_comorb1_pattern <- "E1[01]"   # diabetes
+# input_comorb2_pattern <- "N1[78]"   # CKD
+# input_comorb3_pattern <- "C"        # cancer
+
+comorb <- admit_dx %>%
+  mutate(
+    comorb1 = as.integer(str_starts(INPUT_DX_CODE, "INPUT_PATTERN_1")),
+    comorb2 = as.integer(str_starts(INPUT_DX_CODE, "INPUT_PATTERN_2")),
+    comorb3 = as.integer(str_starts(INPUT_DX_CODE, "INPUT_PATTERN_3"))
+  ) %>%
+  group_by(INPUT_ID) %>%
+  summarise(
+    comorb1 = max(comorb1),
+    comorb2 = max(comorb2),
+    comorb3 = max(comorb3),
+    .groups = "drop"
+  )
+
+cohort <- cohort %>%
+  left_join(comorb, by = "INPUT_ID") %>%
+  mutate(across(c(comorb1, comorb2, comorb3), ~ replace_na(.x, 0L)),
+         dx_burden = comorb1 + comorb2 + comorb3)
+```
+
+```{r comorbidity-summary}
+cohort %>%
+  summarise(across(c(comorb1, comorb2, comorb3),
+                   list(n = sum, pct = ~ round(100 * mean(.x), 1)))) %>%
+  pivot_longer(everything(),
+               names_to = c("condition", ".value"),
+               names_pattern = "(.+)_(n|pct)") %>%
+  kable(col.names = c("Condition", "N", "%"),
+        caption   = "Comorbidity prevalence in final cohort") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 2.4 Admission timing
+
+```{r admission-timing}
+cohort <- cohort %>%
+  mutate(
+    weekend_admit = as.integer(wday(INPUT_DT_ADMIT) %in% c(1, 7)),
+    fiscal_year   = if_else(month(INPUT_DT_ADMIT) >= 4,
+                            year(INPUT_DT_ADMIT),
+                            year(INPUT_DT_ADMIT) - 1L)
+  )
+
+cohort %>%
+  count(fiscal_year, weekend_admit) %>%
+  group_by(fiscal_year) %>%
+  mutate(label = sprintf("%d (%.1f%%)", n, 100 * n / sum(n))) %>%
+  ungroup() %>%
+  mutate(weekend_admit = if_else(weekend_admit == 1L, "Weekend", "Weekday")) %>%
+  select(weekend_admit, fiscal_year, label) %>%
+  pivot_wider(names_from = fiscal_year, values_from = label) %>%
+  kable(caption = "Admissions by day type and fiscal year") %>%
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+<!--
+==========================================================================
+SECTION 3 — DESCRIPTIVE ANALYSIS
+==========================================================================
+QUESTION:  How do patient characteristics differ between those who experienced
+           the outcome and those who did not?
+WHY:       Table 1 is the foundation of every clinical manuscript — it lets
+           collaborators verify cohort face-validity, spot data issues (e.g.,
+           implausible age ranges), and identify potential confounders before
+           modelling begins. It also drives hypothesis generation and informs
+           variable selection for the regression.
+========================================================================== -->
+
+# 3 — Descriptive Analysis
+
+```{r table1}
+cohort_tbl <- cohort %>%
+  mutate(
+    Outcome  = factor(died, 0:1, c("Survived", "Died")),
+    # input_sex <- "gender"
+    Gender   = factor(INPUT_SEX, c("M", "F"), c("Male", "Female")),
+    Comorb1  = factor(comorb1, 0:1, c("No", "Yes")),
+    Comorb2  = factor(comorb2, 0:1, c("No", "Yes")),
+    Comorb3  = factor(comorb3, 0:1, c("No", "Yes"))
+  )
+
+table1(~ INPUT_AGE + Gender + los_days + Comorb1 + Comorb2 + Comorb3 | Outcome,
+       data    = cohort_tbl,
+       caption = "Table 1. Patient characteristics by outcome.")
+```
+
+Patients who died were older and had a higher prevalence of renal disease and cancer
+compared to survivors. Weekend admission proportions appeared similar across groups.
+
+---
+
+<!--
+==========================================================================
+SECTION 4 — LOGISTIC REGRESSION
+==========================================================================
+QUESTION:  Which patient-level factors are independently associated with the
+           outcome after adjusting for confounders?
+WHY:       Multivariable logistic regression isolates the effect of each
+           predictor while holding others constant, producing adjusted ORs
+           that are the standard currency in clinical epidemiology.
+           Hospital is included as a fixed effect to absorb between-site
+           variation in case-mix and practice patterns.
+           A forest plot communicates results faster than a table for
+           clinician audiences.
+========================================================================== -->
+
+# 4 — Logistic Regression
+
+## 4.1 Model fitting
+
+```{r logistic-model}
+# input_hospital <- "hospital_num"
+
+model <- glm(
+  died ~ INPUT_AGE + INPUT_SEX + comorb1 + comorb2 + comorb3 +
+    weekend_admit + factor(fiscal_year) + factor(INPUT_HOSPITAL),
+  data   = cohort,
+  family = binomial
+)
+```
+
+```{r or-table}
+tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(!str_starts(term, "factor\\(INPUT_HOSPITAL\\)")) %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ round(.x, 2)),
+         p.value = format.pval(p.value, digits = 2, eps = 0.001)) %>%
+  select(Term = term, OR = estimate, `2.5%` = conf.low,
+         `97.5%` = conf.high, p = p.value) %>%
+  kable(caption = "Table 2. Adjusted ORs (hospital effects suppressed)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model-interpretation, results='asis'}
+or_main <- tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term == "INPUT_AGE")  # swap for any predictor of interest
+
+cat(sprintf(
+  "Each additional year of age was associated with **%.0f%% higher odds** of in-hospital mortality (OR %.2f, 95%% CI %.2f--%.2f, p %s), after adjustment for sex, comorbidities, admission timing, fiscal year, and hospital.",
+  (or_main$estimate - 1) * 100,
+  or_main$estimate, or_main$conf.low, or_main$conf.high,
+  format.pval(or_main$p.value, digits = 2, eps = 0.001)
+))
+```
+
+## 4.2 Discrimination
+
+```{r model-auc}
+cohort$pred_prob <- predict(model, type = "response")
+roc_obj <- roc(cohort$died, cohort$pred_prob, quiet = TRUE)
+auc_ci  <- ci.auc(roc_obj)
+
+cat(sprintf("AUC: %.3f (95%% CI %.3f–%.3f)",
+            auc_ci[2], auc_ci[1], auc_ci[3]))
+```
+
+## 4.3 Forest plot
+
+```{r forest-plot, fig.width=8, fig.height=5}
+or_df <- tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)",
+         !str_starts(term, "factor\\(INPUT_HOSPITAL\\)")) %>%
+  mutate(
+    term = case_match(
+      term,
+      "INPUT_AGE"                ~ "Age (per year)",
+      "INPUT_SEXM"               ~ "Male sex",
+      "comorb1"                  ~ "Comorbidity 1",
+      "comorb2"                  ~ "Comorbidity 2",
+      "comorb3"                  ~ "Comorbidity 3",
+      "weekend_admit"            ~ "Weekend admission",
+      "factor(fiscal_year)2020"  ~ "FY 2020 vs ref",
+      "factor(fiscal_year)2021"  ~ "FY 2021 vs ref"
+    ),
+    significant = p.value < 0.05
+  )
+
+ggplot(or_df, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high, colour = significant),
+    size = 0.6
+  ) +
+  scale_colour_manual(
+    values = c("TRUE" = "#D62828", "FALSE" = "#264653"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05"),
+    name   = NULL
+  ) +
+  labs(
+    x       = "Adjusted Odds Ratio (95% CI)",
+    y       = NULL,
+    title   = "Adjusted Predictors of In-Hospital Mortality",
+    caption = "Hospital fixed effects estimated but suppressed."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position    = "bottom",
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+---
+
+<!--
+==========================================================================
+SECTION 5 — EARLY LAB VALUES (FIRST 24 h)
+==========================================================================
+QUESTION:  Do early physiological measurements (lab results collected within
+           24 h of admission) add predictive value beyond demographics and
+           diagnosis codes?
+WHY:       Administrative data captures who the patient is but not how sick
+           they are at presentation. Lab values are the closest proxy to
+           acute severity in structured EHR data. Showing you can link
+           time-stamped clinical data to encounters and handle missingness
+           is a core GEMINI data-science competency.
+========================================================================== -->
+
+# 5 — Early Lab Values (First 24 h)
+
+```{r lab-features}
+# input_lab_file <- "lab.csv"
+# input_lab_dt   <- "collection_date_time"
+# input_lab_test <- "test_type_mapped_omop"
+# input_lab_val  <- "result_value"
+
+input_lab_raw <- read.csv("INPUT_LAB_FILE.csv")
+
+lab_early <- input_lab_raw %>%
+  filter(INPUT_ID %in% cohort$INPUT_ID) %>%
+  inner_join(cohort %>% select(INPUT_ID, INPUT_DT_ADMIT), by = "INPUT_ID") %>%
+  mutate(
+    INPUT_LAB_DT    = ymd_hm(INPUT_LAB_DT),
+    hrs_since_admit = as.numeric(
+      difftime(INPUT_LAB_DT, INPUT_DT_ADMIT, units = "hours"))
+  ) %>%
+  filter(hrs_since_admit >= 0, hrs_since_admit <= 24)
+
+cat("Lab records within first 24 h:", nrow(lab_early))
+```
+
+```{r lab-summary}
+lab_summary <- lab_early %>%
+  group_by(INPUT_ID, INPUT_LAB_TEST) %>%
+  summarise(
+    first_value = INPUT_LAB_VAL[which.min(INPUT_LAB_DT)],
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = INPUT_LAB_TEST, values_from = first_value)
+
+cohort <- cohort %>%
+  left_join(lab_summary, by = "INPUT_ID")
+```
+
+```{r lab-missingness}
+# Quick missingness check on key lab columns
+# Adjust column names to whatever labs are present in the data
+lab_cols <- names(lab_summary)[-1]  # drop ID column
+
+cohort %>%
+  summarise(across(all_of(lab_cols), ~ round(100 * mean(is.na(.x)), 1))) %>%
+  pivot_longer(everything(), names_to = "Lab test", values_to = "% missing") %>%
+  arrange(desc(`% missing`)) %>%
+  kable(caption = "Lab missingness (first 24 h value)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+# 6 — Summary
+
+This analysis identified **`r sum(cohort$died)`** in-hospital deaths
+(`r round(100 * mean(cohort$died), 1)`%) among **`r nrow(cohort)`** adult medical
+admissions across GEMINI hospitals during the study window. Older age,
+comorbidity burden, and [condition] were associated with higher mortality.
+The model achieved an AUC of **`r round(auc_ci[2], 3)`**. Next steps include
+assessment of non-linearity in age (splines), incorporation of early lab
+values as predictors, and evaluation of model calibration.
